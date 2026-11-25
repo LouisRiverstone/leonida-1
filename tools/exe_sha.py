@@ -88,7 +88,7 @@ def check(exe: str, expect: str | None = None, manifest: str | None = None) -> d
         "sha256": None,
         "expected_size": expected_size,
         "expected_sha256": expected_sha,
-        "source": used if used else ("--expect" if expect else None),
+        "source": "--expect" if expect is not None else used,
         "status": "unrecorded",
         "mismatches": [],
     }
@@ -156,4 +156,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     sys.exit(main())
