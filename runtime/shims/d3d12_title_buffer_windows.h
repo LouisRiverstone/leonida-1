@@ -1,6 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <utility>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -20,9 +24,50 @@ class TitleBufferWindows {
     };
     std::vector<Block> blocks_;
     VkDeviceSize reserved_{};
+    // A new block's allocation failed at this time: none is tried again for kRetryAfter. After the story load the
+    // driver refused every 4 MiB block (VK_ERROR_OUT_OF_HOST_MEMORY), and each V# that wanted a copy tried again,
+    // through DeviceState::allocate's sleeping retries under the device's memory lock: one submission spent 28-35 s
+    // there (speed-8, speed-9). A view refused meanwhile goes without a copy, as one past the cap does.
+    static constexpr auto kRetryAfter = std::chrono::seconds(2);
+    std::chrono::steady_clock::time_point failed_at_{};
+    bool failed_ = false;
+    bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
+    std::uint64_t quick_refusals_ = 0;
+    // The blocks' (device address, capacity), readable without the owner's lock: published in order, never removed
+    // before release().
+    static constexpr std::size_t kPublished = 4096;
+    struct Published {
+        VkDeviceAddress address;
+        VkDeviceSize capacity;
+        std::uint8_t* mapped;
+        VkBuffer buffer;
+    };
+    std::array<Published, kPublished> published_{};
+    std::atomic<std::size_t> published_count_{0};
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
+    // f(device address, capacity) for each block made so far; from any thread.
+    template <class F>
+    void for_each_block(F&& f) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) f(published_[i].address, published_[i].capacity);
+    }
+    // The block whose mapping holds [p, p + bytes): its buffer and the offset of p in it. From any thread.
+    bool find_mapped(const std::uint8_t* p, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) {
+            const Published& b = published_[i];
+            if (p >= b.mapped && p - b.mapped < std::ptrdiff_t(b.capacity) &&
+                bytes <= std::size_t(b.capacity) - std::size_t(p - b.mapped)) {
+                buffer = b.buffer;
+                offset = VkDeviceSize(p - b.mapped);
+                return true;
+            }
+        }
+        return false;
+    }
+    std::size_t block_count() const { return published_count_.load(std::memory_order_acquire); }
 
     template<class Device>
     bool allocate(Device& d, VkDeviceSize bytes, VkDeviceSize& offset, std::uint8_t*& mapped,
@@ -45,6 +90,15 @@ public:
                 if (take(blocks_[i - 1])) return true;
         auto& vk = d.context->vk;
         if (!vk.vkGetBufferDeviceAddress) return false;
+        if (failed_ && std::chrono::steady_clock::now() - failed_at_ < kRetryAfter) {
+            ++quick_refusals_;
+            return false;
+        }
+        const auto failed = [&] {
+            failed_ = true;
+            failed_at_ = std::chrono::steady_clock::now();
+            return false;
+        };
         Block b{};
         b.capacity = std::max(bytes, block_size);
         if (b.capacity > cap - reserved_) {
@@ -55,7 +109,7 @@ public:
         info.size = b.capacity;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         d.share(info);
-        if (vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer) != VK_SUCCESS) return false;
+        if (vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer) != VK_SUCCESS) return failed();
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(d.info.device, b.buffer, &req);
         if (req.size > cap - reserved_) {
@@ -63,9 +117,20 @@ public:
             vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
             return false;
         }
-        b.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                  (device_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0),
-                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+        // Device-local (Resizable BAR) when asked and while the driver gives it; host memory otherwise. After the
+        // story load the driver refused every 4 MiB device-local, host-visible block with a device address
+        // (VK_ERROR_OUT_OF_HOST_MEMORY, speed-8/-9) while host memory still served: once that happens, later blocks
+        // go straight to host memory instead of through DeviceState::allocate's sleeping retries first.
+        VkMemoryPropertyFlags chosen = 0;
+        const bool want_local = device_local && !local_refused_;
+        b.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              want_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, &chosen, true);
+        if (b.memory && want_local && !(chosen & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            local_refused_ = true;
+            std::fprintf(stderr, "[rt] d3d12: title buffer windows: device-local memory refused a %llu KiB block; "
+                                 "this and later blocks are in host memory\n",
+                         static_cast<unsigned long long>(req.size >> 10));
+        }
         void* host{};
         if (b.memory && vk.vkBindBufferMemory(d.info.device, b.buffer, b.memory, 0) == VK_SUCCESS &&
             vk.vkMapMemory(d.info.device, b.memory, 0, VK_WHOLE_SIZE, 0, &host) == VK_SUCCESS) {
@@ -77,6 +142,10 @@ public:
             if (b.address && biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
                 b.mapped = static_cast<std::uint8_t*>(host);
                 blocks_.push_back(b);
+                if (const std::size_t n = published_count_.load(std::memory_order_relaxed); n < kPublished) {
+                    published_[n] = {b.address, b.capacity, b.mapped, b.buffer};
+                    published_count_.store(n + 1, std::memory_order_release);
+                }
                 reserved_ += req.size;
                 if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
                     std::fprintf(stderr, "[rt] d3d12: title buffer shadows outside the arena: %zu blocks, "
@@ -89,8 +158,10 @@ public:
         }
         vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
         if (b.memory) vk.vkFreeMemory(d.info.device, b.memory, nullptr);
-        return false;
+        return failed();
     }
+    // Allocations refused at once because a new block failed less than kRetryAfter ago.
+    std::uint64_t quick_refusals() const { return quick_refusals_; }
 
     bool lookup(VkDeviceAddress address, std::uint64_t& host, std::uint64_t& remaining) const {
         for (const auto& b : blocks_) {
@@ -113,6 +184,7 @@ public:
             d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         }
         blocks_.clear();
+        published_count_.store(0, std::memory_order_release);
         reserved_ = 0;
     }
 };
